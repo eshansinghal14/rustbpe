@@ -1,5 +1,9 @@
 # rustbpe
 
+[![CI](https://github.com/karpathy/rustbpe/actions/workflows/ci.yml/badge.svg)](https://github.com/karpathy/rustbpe/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/rustbpe.svg)](https://pypi.org/project/rustbpe/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > The missing tiktoken training code
 
 A lightweight Rust library for training GPT-style BPE tokenizers. The [tiktoken](https://github.com/openai/tiktoken) library is excellent for inference but doesn't support training. The HuggingFace [tokenizers](https://github.com/huggingface/tokenizers) library supports training but carries significant complexity from years of accumulated tokenizer variants. My [minbpe](https://github.com/karpathy/minbpe) library handles both training and inference, but only in Python and not optimized for speed.

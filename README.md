@@ -86,17 +86,21 @@ ids = enc.encode("hello world")
 text = enc.decode(ids)
 ```
 
-### Custom regex pattern
+### Custom regex patterns
 
-By default, rustbpe uses the GPT-4 tokenization pattern. You can provide your own:
+By default, rustbpe uses the GPT-4 chunk pattern and a default superchunk pattern. You can pass custom patterns via `train_kwargs` (e.g. from a config) using `chunk_pattern` and `superchunk_pattern`:
 
 ```python
 tokenizer.train_from_iterator(
     texts,
     vocab_size=4096,
-    pattern=r"[a-zA-Z]+|[0-9]+|\s+"  # custom pattern
+    chunk_pattern=r"[a-zA-Z]+|[0-9]+|\s+",   # custom chunk split regex
+    superchunk_pattern=r"[.!?]\s+",            # optional: for 2-phase when allow_superchunk=True
 )
 ```
+
+- **chunk_pattern**: regex that splits text into chunks (each match is a pre-tokenization chunk). Default: GPT-4 style pattern.
+- **superchunk_pattern**: when `allow_superchunk=True`, regex that splits text into superchunks before applying the chunk pattern within each. Default: punctuation/line boundaries.
 
 ## API Reference
 
@@ -105,12 +109,12 @@ tokenizer.train_from_iterator(
 | Method | Description |
 |--------|-------------|
 | `Tokenizer()` | Create a new tokenizer |
-| `train_from_iterator(texts, vocab_size, buffer_size=8192, pattern=None)` | Train on an iterator of strings |
+| `train_from_iterator(texts, vocab_size, chunk_pattern=None, superchunk_pattern=None, allow_superchunk=False, max_superchunk_chunks=4096, tokenizer_dir=None)` | Train on an iterator of strings |
 | `encode(text)` | Encode a string to token IDs |
 | `decode(ids)` | Decode token IDs back to a string |
 | `batch_encode(texts)` | Encode multiple strings in parallel |
 | `vocab_size` | Property: vocabulary size (256 + number of merges) |
-| `get_pattern()` | Get the regex pattern used for pre-tokenization |
+| `get_pattern()` | Get the chunk regex pattern used for pre-tokenization |
 | `get_mergeable_ranks()` | Get token bytes and ranks for tiktoken export |
 
 ## Development

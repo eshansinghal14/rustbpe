@@ -37,8 +37,9 @@ type Pair = (u32, u32);
 #[pyclass]
 pub struct Tokenizer {
     pub merges: StdHashMap<Pair, u32>,
-    pub pattern: String,
-    compiled_pattern: Regex,
+    /// Chunk regex used for splitting text into chunks (and for encode).
+    pub chunk_pattern: String,
+    compiled_chunk_pattern: Regex,
 }
 
 fn merge_seq_fingerprint(seq: &[(Pair, u64)]) -> u64 {
@@ -65,7 +66,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn load_phase1_cache(path: &str, vocab_size: u32, pattern: &str) -> Option<Vec<(Pair, u64)>> {
+fn load_phase1_cache(path: &str, vocab_size: u32, chunk_pattern: &str) -> Option<Vec<(Pair, u64)>> {
     let p = Path::new(path);
     if !p.exists() { return None; }
     let mut s = String::new();
@@ -84,8 +85,8 @@ fn load_phase1_cache(path: &str, vocab_size: u32, pattern: &str) -> Option<Vec<(
     if vs != vocab_size { return None; }
 
     let pat_line = lines.next()?;
-    let pat = pat_line.strip_prefix("pattern=")?;
-    if pat != pattern { return None; }
+    let pat = pat_line.strip_prefix("chunk_pattern=").or_else(|| pat_line.strip_prefix("pattern="))?;
+    if pat != chunk_pattern { return None; }
 
     let mut out: Vec<(Pair, u64)> = Vec::new();
     for line in lines {
@@ -101,7 +102,7 @@ fn load_phase1_cache(path: &str, vocab_size: u32, pattern: &str) -> Option<Vec<(
     Some(out)
 }
 
-fn save_phase1_cache(path: &str, vocab_size: u32, pattern: &str, phase1_seq: &[(Pair, u64)]) {
+fn save_phase1_cache(path: &str, vocab_size: u32, chunk_pattern: &str, phase1_seq: &[(Pair, u64)]) {
     let f = match fs::File::create(path) {
         Ok(x) => x,
         Err(_) => return,
@@ -110,7 +111,7 @@ fn save_phase1_cache(path: &str, vocab_size: u32, pattern: &str, phase1_seq: &[(
 
     if writeln!(f, "RUSTBPE_PHASE1_CACHE_V2").is_err() { return; }
     if writeln!(f, "vocab_size={}", vocab_size).is_err() { return; }
-    if writeln!(f, "pattern={}", pattern).is_err() { return; }
+    if writeln!(f, "chunk_pattern={}", chunk_pattern).is_err() { return; }
 
     let mut token_bytes: Vec<Vec<u8>> = (0..256_u32).map(|i| vec![i as u8]).collect();
     for (k, &((a, b), _)) in phase1_seq.iter().enumerate() {
@@ -133,7 +134,8 @@ fn save_phase1_cache(path: &str, vocab_size: u32, pattern: &str, phase1_seq: &[(
 fn load_phase2_cache(
     path: &str,
     vocab_size: u32,
-    pattern: &str,
+    chunk_pattern: &str,
+    superchunk_pattern: &str,
     phase1_fp: u64,
 ) -> Option<Vec<(Pair, u64)>> {
     let p = Path::new(path);
@@ -154,21 +156,36 @@ fn load_phase2_cache(
     if vs != vocab_size { return None; }
 
     let pat_line = lines.next()?;
-    let pat = pat_line.strip_prefix("pattern=")?;
-    if pat != pattern { return None; }
+    let pat = pat_line.strip_prefix("chunk_pattern=").or_else(|| pat_line.strip_prefix("pattern="))?;
+    if pat != chunk_pattern { return None; }
 
     let fp_line = lines.next()?;
     let fp = fp_line.strip_prefix("phase1_fp=")?.parse::<u64>().ok()?;
     if fp != phase1_fp { return None; }
 
+    // New format has superchunk_pattern= line; old format does not (first line is merge data).
+    let merge_lines: Vec<&str> = match lines.next() {
+        Some(line) if line.starts_with("superchunk_pattern=") => {
+            let sp = line.strip_prefix("superchunk_pattern=").unwrap();
+            if sp != superchunk_pattern { return None; }
+            lines.collect()
+        }
+        Some(first_merge) => {
+            if superchunk_pattern != SUPER_CHUNK_PATTERN { return None; }
+            let mut rest: Vec<&str> = lines.collect();
+            rest.insert(0, first_merge);
+            rest
+        }
+        None => Vec::new(),
+    };
+
     let mut out: Vec<(Pair, u64)> = Vec::new();
-    for line in lines {
+    for line in merge_lines {
         if line.trim().is_empty() { continue; }
         let mut it = line.split_whitespace();
         let l = it.next()?.parse::<u32>().ok()?;
         let r = it.next()?.parse::<u32>().ok()?;
         let f = it.next()?.parse::<u64>().ok()?;
-        // V2 may have trailing debug fields; we intentionally ignore them.
         let _ = v2;
         out.push(((l, r), f));
     }
@@ -178,7 +195,8 @@ fn load_phase2_cache(
 fn save_phase2_cache(
     path: &str,
     vocab_size: u32,
-    pattern: &str,
+    chunk_pattern: &str,
+    superchunk_pattern: &str,
     phase1_fp: u64,
     phase1_seq: &[(Pair, u64)],
     phase2_seq: &[(Pair, u64)],
@@ -191,8 +209,9 @@ fn save_phase2_cache(
 
     if writeln!(f, "RUSTBPE_PHASE2_CACHE_V2").is_err() { return; }
     if writeln!(f, "vocab_size={}", vocab_size).is_err() { return; }
-    if writeln!(f, "pattern={}", pattern).is_err() { return; }
+    if writeln!(f, "chunk_pattern={}", chunk_pattern).is_err() { return; }
     if writeln!(f, "phase1_fp={}", phase1_fp).is_err() { return; }
+    if writeln!(f, "superchunk_pattern={}", superchunk_pattern).is_err() { return; }
 
     // Build token bytes for Phase 1 and Phase 2 internal id spaces so we can write
     // human-debuggable merged strings to the cache.
@@ -735,8 +754,8 @@ impl Tokenizer {
     pub fn new() -> Self {
         Self {
             merges: StdHashMap::new(),
-            pattern: String::new(),
-            compiled_pattern: Regex::new("").expect("empty regex should always compile"),
+            chunk_pattern: String::new(),
+            compiled_chunk_pattern: Regex::new("").expect("empty regex should always compile"),
         }
     }
 
@@ -750,22 +769,27 @@ impl Tokenizer {
     ///
     /// The streaming pass always collects both chunk_counts and seq_counts in a
     /// single iteration when allow_superchunk=True, so the iterator is consumed once.
-    #[pyo3(signature = (iterator, vocab_size, pattern=None, allow_superchunk=false, max_superchunk_chunks=4096, tokenizer_dir=None))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, pattern=None, allow_superchunk=False, max_superchunk_chunks=4096, tokenizer_dir=None)")]
+    #[pyo3(signature = (iterator, vocab_size, chunk_pattern=None, superchunk_pattern=None, allow_superchunk=false, max_superchunk_chunks=4096, tokenizer_dir=None))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, chunk_pattern=None, superchunk_pattern=None, allow_superchunk=False, max_superchunk_chunks=4096, tokenizer_dir=None)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
         iterator: &pyo3::Bound<'_, pyo3::PyAny>,
         vocab_size: u32,
-        pattern: Option<String>,
+        chunk_pattern: Option<String>,
+        superchunk_pattern: Option<String>,
         allow_superchunk: bool,
         max_superchunk_chunks: usize,
         tokenizer_dir: Option<String>,
     ) -> PyResult<()> {
-        let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
-        self.pattern = pattern_str.clone();
-        self.compiled_pattern = Regex::new(&pattern_str).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid regex pattern: {}", e))
+        let chunk_pattern_str = chunk_pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
+        let superchunk_pattern_str = superchunk_pattern.unwrap_or_else(|| SUPER_CHUNK_PATTERN.to_string());
+        self.chunk_pattern = chunk_pattern_str.clone();
+        self.compiled_chunk_pattern = Regex::new(&chunk_pattern_str).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid chunk_pattern regex: {}", e))
+        })?;
+        let compiled_superchunk = Regex::new(&superchunk_pattern_str).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid superchunk_pattern regex: {}", e))
         })?;
 
         let (phase1_cache_path, phase2_cache_path) = if let Some(ref d) = tokenizer_dir {
@@ -781,9 +805,9 @@ impl Tokenizer {
         // Fast path: if both caches exist and are valid, skip ingestion/training.
         if allow_superchunk {
             if let (Some(ref p1), Some(ref p2)) = (&phase1_cache_path, &phase2_cache_path) {
-                if let Some(p1_seq) = load_phase1_cache(p1, vocab_size, &pattern_str) {
+                if let Some(p1_seq) = load_phase1_cache(p1, vocab_size, &chunk_pattern_str) {
                     let fp = merge_seq_fingerprint(&p1_seq);
-                    if let Some(p2_seq) = load_phase2_cache(p2, vocab_size, &pattern_str, fp) {
+                    if let Some(p2_seq) = load_phase2_cache(p2, vocab_size, &chunk_pattern_str, &superchunk_pattern_str, fp) {
                         log::info!(
                             "train_from_iterator: loaded Phase 1 + Phase 2 caches from {}",
                             tokenizer_dir.as_deref().unwrap_or("<unknown>")
@@ -798,7 +822,7 @@ impl Tokenizer {
         let mut cached_phase1: Option<Vec<(Pair, u64)>> = None;
         if allow_superchunk {
             if let Some(ref p) = phase1_cache_path {
-                cached_phase1 = load_phase1_cache(p, vocab_size, &pattern_str);
+                cached_phase1 = load_phase1_cache(p, vocab_size, &chunk_pattern_str);
                 if let Some(ref seq) = cached_phase1 {
                     log::info!(
                         "train_from_iterator: loaded Phase 1 cache from {} ({} merges)",
@@ -821,8 +845,7 @@ impl Tokenizer {
         // Only populated when allow_superchunk=true.
         let mut seq_counts: AHashMap<Vec<CompactString>, i32> = AHashMap::new();
 
-        let superchunk_splitter =
-            Regex::new(SUPER_CHUNK_PATTERN).expect("SUPER_CHUNK_PATTERN must compile");
+        let superchunk_splitter = compiled_superchunk;
 
         let buffer_size: usize = 8192;
         let mut buf: Vec<String> = Vec::with_capacity(buffer_size);
@@ -857,7 +880,7 @@ impl Tokenizer {
             if buf.is_empty() && exhausted { break; }
 
             total_texts += buf.len() as u64;
-            let pattern = self.compiled_pattern.clone();
+            let chunk_re = self.compiled_chunk_pattern.clone();
 
             if allow_superchunk {
                 let sc_splitter = superchunk_splitter.clone();
@@ -877,7 +900,7 @@ impl Tokenizer {
                                 for (a, b) in superchunk_ranges(s, &sc_splitter) {
                                     let sc = &s[a..b];
                                     let mut pieces: Vec<CompactString> = Vec::new();
-                                    for mat in pattern.find_iter(sc) {
+                                    for mat in chunk_re.find_iter(sc) {
                                         let cs = CompactString::from(mat.expect("regex match failed").as_str());
                                         *chunk_m.entry(cs.clone()).or_default() += 1;
                                         pieces.push(cs);
@@ -915,7 +938,7 @@ impl Tokenizer {
                                 for (a, b) in superchunk_ranges(s, &sc_splitter) {
                                     let sc = &s[a..b];
                                     let mut pieces: Vec<CompactString> = Vec::new();
-                                    for mat in pattern.find_iter(sc) {
+                                    for mat in chunk_re.find_iter(sc) {
                                         let cs = CompactString::from(mat.expect("regex match failed").as_str());
                                         pieces.push(cs);
                                     }
@@ -944,7 +967,7 @@ impl Tokenizer {
                     buf.par_iter()
                         .map(|s| {
                             let mut m: AHashMap<CompactString, i32> = AHashMap::new();
-                            for mat in pattern.find_iter(s) {
+                            for mat in chunk_re.find_iter(s) {
                                 let cs = CompactString::from(mat.expect("regex match failed").as_str());
                                 *m.entry(cs).or_default() += 1;
                             }
@@ -981,7 +1004,7 @@ impl Tokenizer {
                 let seq = train_and_record(p1_words, p1_counts, vocab_size, false, 0);
                 log::info!("train_from_iterator: Phase 1 complete — {} within-chunk merges", seq.len());
                 if let Some(ref p) = phase1_cache_path {
-                    save_phase1_cache(p, vocab_size, &pattern_str, &seq);
+                    save_phase1_cache(p, vocab_size, &chunk_pattern_str, &seq);
                     log::info!("train_from_iterator: wrote Phase 1 cache to {}", p);
                 }
                 seq
@@ -996,7 +1019,7 @@ impl Tokenizer {
             // ---- Phase 2: cross-chunk BPE ----
             log::info!("train_from_iterator: Phase 2 — cross-chunk BPE over {} unique sequences", seq_counts.len());
             let phase2_seq = if let Some(ref p2) = phase2_cache_path {
-                if let Some(seq) = load_phase2_cache(p2, vocab_size, &pattern_str, phase1_fp) {
+                if let Some(seq) = load_phase2_cache(p2, vocab_size, &chunk_pattern_str, &superchunk_pattern_str, phase1_fp) {
                     log::info!("train_from_iterator: loaded Phase 2 cache from {} ({} merges)", p2, seq.len());
                     seq
                 } else {
@@ -1004,7 +1027,7 @@ impl Tokenizer {
                     let phase2_id_offset: u32 = phase1_seq.len() as u32;
                     let seq = train_and_record(p2_words, p2_counts, vocab_size, true, phase2_id_offset);
                     log::info!("train_from_iterator: Phase 2 complete — {} cross-chunk merges", seq.len());
-                    save_phase2_cache(p2, vocab_size, &pattern_str, phase1_fp, &phase1_seq, &seq);
+                    save_phase2_cache(p2, vocab_size, &chunk_pattern_str, &superchunk_pattern_str, phase1_fp, &phase1_seq, &seq);
                     log::info!("train_from_iterator: wrote Phase 2 cache to {}", p2);
                     seq
                 }
@@ -1041,7 +1064,7 @@ impl Tokenizer {
         Ok(())
     }
 
-    pub fn get_pattern(&self) -> String { self.pattern.clone() }
+    pub fn get_pattern(&self) -> String { self.chunk_pattern.clone() }
 
     #[getter]
     pub fn vocab_size(&self) -> u32 { 256 + self.merges.len() as u32 }
@@ -1065,7 +1088,7 @@ impl Tokenizer {
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut all_ids = Vec::new();
-        for m in self.compiled_pattern.find_iter(text) {
+        for m in self.compiled_chunk_pattern.find_iter(text) {
             let chunk = match m {
                 Ok(mat) => mat.as_str(),
                 Err(e) => { log::warn!("encode: regex error, skipping chunk: {}", e); continue; }
@@ -1653,7 +1676,7 @@ mod tests {
     fn test_tokenizer_new_state() {
         let tok = Tokenizer::new();
         assert!(tok.merges.is_empty());
-        assert!(tok.pattern.is_empty());
+        assert!(tok.chunk_pattern.is_empty());
         assert_eq!(tok.vocab_size(), 256);
     }
 
@@ -1690,8 +1713,8 @@ mod tests {
     fn test_encode_no_merges_returns_bytes() {
         let tok = Tokenizer {
             merges: StdHashMap::new(),
-            pattern: r"\w+".to_string(),
-            compiled_pattern: Regex::new(r"\w+").unwrap(),
+            chunk_pattern: r"\w+".to_string(),
+            compiled_chunk_pattern: Regex::new(r"\w+").unwrap(),
         };
         assert_eq!(tok.encode("hi"), vec![104, 105]);
     }
@@ -1700,7 +1723,7 @@ mod tests {
     fn test_encode_applies_merge() {
         let mut merges = StdHashMap::new();
         merges.insert((104, 105), 256);
-        let tok = Tokenizer { merges, pattern: r"\w+".to_string(), compiled_pattern: Regex::new(r"\w+").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: r"\w+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+").unwrap() };
         assert_eq!(tok.encode("hi"), vec![256]);
         assert_eq!(tok.encode("hip"), vec![256, 112]);
     }
@@ -1710,7 +1733,7 @@ mod tests {
         let mut merges = StdHashMap::new();
         merges.insert((97, 97), 256);
         merges.insert((256, 97), 257);
-        let tok = Tokenizer { merges, pattern: r"\w+".to_string(), compiled_pattern: Regex::new(r"\w+").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: r"\w+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+").unwrap() };
         assert_eq!(tok.encode("aaa"), vec![257]);
         assert_eq!(tok.encode("aaaa"), vec![256, 256]);
         assert_eq!(tok.encode("aaaaa"), vec![256, 257]);
@@ -1718,13 +1741,13 @@ mod tests {
 
     #[test]
     fn test_encode_empty_string() {
-        let tok = Tokenizer { merges: StdHashMap::new(), pattern: r"\w+".to_string(), compiled_pattern: Regex::new(r"\w+").unwrap() };
+        let tok = Tokenizer { merges: StdHashMap::new(), chunk_pattern: r"\w+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+").unwrap() };
         assert!(tok.encode("").is_empty());
     }
 
     #[test]
     fn test_encode_no_matches() {
-        let tok = Tokenizer { merges: StdHashMap::new(), pattern: r"\w+".to_string(), compiled_pattern: Regex::new(r"\w+").unwrap() };
+        let tok = Tokenizer { merges: StdHashMap::new(), chunk_pattern: r"\w+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+").unwrap() };
         assert!(tok.encode("   ").is_empty());
     }
 
@@ -1747,7 +1770,7 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let mut merges = StdHashMap::new();
         merges.insert((104, 105), 256);
-        let tok = Tokenizer { merges, pattern: r"\w+|\s+".to_string(), compiled_pattern: Regex::new(r"\w+|\s+").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: r"\w+|\s+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+|\s+").unwrap() };
         let text = "hi there";
         assert_eq!(tok.decode(tok.encode(text)).unwrap(), text);
     }
@@ -1758,7 +1781,7 @@ mod tests {
         merges.insert((104, 101), 256); // he
         merges.insert((108, 108), 257); // ll
         merges.insert((256, 257), 258); // hell
-        let tok = Tokenizer { merges, pattern: r"\w+|\s+".to_string(), compiled_pattern: Regex::new(r"\w+|\s+").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: r"\w+|\s+".to_string(), compiled_chunk_pattern: Regex::new(r"\w+|\s+").unwrap() };
         let text = "hello world";
         assert_eq!(tok.decode(tok.encode(text)).unwrap(), text);
     }
@@ -1776,7 +1799,7 @@ mod tests {
     fn test_get_mergeable_ranks_with_merge() {
         let mut merges = StdHashMap::new();
         merges.insert((65, 66), 256);
-        let tok = Tokenizer { merges, pattern: String::new(), compiled_pattern: Regex::new("").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: String::new(), compiled_chunk_pattern: Regex::new("").unwrap() };
         let ranks = tok.get_mergeable_ranks();
         assert_eq!(ranks.len(), 257);
         assert_eq!(ranks[256], (vec![65u8, 66u8], 256));
@@ -1787,7 +1810,7 @@ mod tests {
         let mut merges = StdHashMap::new();
         merges.insert((65, 66), 256);  // AB
         merges.insert((256, 67), 257); // ABC
-        let tok = Tokenizer { merges, pattern: String::new(), compiled_pattern: Regex::new("").unwrap() };
+        let tok = Tokenizer { merges, chunk_pattern: String::new(), compiled_chunk_pattern: Regex::new("").unwrap() };
         let ranks = tok.get_mergeable_ranks();
         assert_eq!(ranks[256], (vec![65u8, 66u8], 256));
         assert_eq!(ranks[257], (vec![65u8, 66u8, 67u8], 257));

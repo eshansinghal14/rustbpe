@@ -26,6 +26,11 @@ const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{
 /// their boundary in Phase 2; chunks in different superchunks cannot.
 const SUPER_CHUNK_PATTERN: &str = r#"[,;:!?()\[\]{}\r\n"]++|\.(?=\s|$)"#;
 
+/// Internal token ids for raw GPT4 chunk strings in superchunk-only training.
+/// These are **not** part of the public vocabulary (`vocab_size` / ranks): only
+/// superchunk merge outputs occupy ids `256..`.
+pub const CHUNK_ATOM_ID_BASE: u32 = 0x0100_0000;
+
 type Pair = (u32, u32);
 
 /// A Byte Pair Encoding tokenizer.
@@ -43,9 +48,10 @@ pub struct Tokenizer {
     /// Superchunk regex (only set after superchunk-only training).
     pub superchunk_pattern: Option<String>,
     compiled_superchunk: Option<Regex>,
-    /// GPT4 chunk string → token id, when each chunk is a single token (superchunk-only training).
+    /// GPT4 chunk string → internal id (`CHUNK_ATOM_ID_BASE` + i) for superchunk-only encode/decode.
+    /// Not counted in `vocab_size` (only superchunk merges are).
     pub chunk_atom_to_id: Option<StdHashMap<String, u32>>,
-    /// `chunk_atom_to_id` ranks sort lexicographically by chunk string; id `256 + i` maps to these bytes.
+    /// Index `i` is the UTF-8 bytes for chunk id `CHUNK_ATOM_ID_BASE + i`.
     chunk_atom_id_to_bytes: Option<Vec<Vec<u8>>>,
 }
 
@@ -976,27 +982,45 @@ fn remap_id(id: u32, id_remap: &AHashMap<u32, u32>) -> u32 {
 /// `atomic_chunk_vocab` is how many token ids `256..256+atomic_chunk_vocab-1` are primitive
 /// chunk types (superchunk-only training with no Phase 1). They map to themselves globally
 /// before any merge is applied.
+///
+/// `virtual_chunk_atoms`: if `Some((base, count))`, seeds ids `base..base+count-1` as identity
+/// (chunk types not in the public vocab) and sets the first merge output to global `256`.
+/// Used with [`CHUNK_ATOM_ID_BASE`] so only superchunk merge tokens occupy `256..` in the model.
 fn interleave_merge_sequences(
     vocab_size: u32,
     phase1_seq: Vec<(Pair, u64)>,
     phase2_seq: Vec<(Pair, u64)>,
     phase2_internal_offset: u32,
     atomic_chunk_vocab: u32,
+    virtual_chunk_atoms: Option<(u32, u32)>,
 ) -> StdHashMap<Pair, u32> {
     let total = phase1_seq.len() + phase2_seq.len();
     log::info!(
-        "interleave_merge_sequences: {} Phase 1 + {} Phase 2 = {} total merges (phase2_offset={} atomic_chunks={})",
-        phase1_seq.len(), phase2_seq.len(), total, phase2_internal_offset, atomic_chunk_vocab
+        "interleave_merge_sequences: {} Phase 1 + {} Phase 2 = {} total merges (phase2_offset={} atomic_chunks={} virtual={:?})",
+        phase1_seq.len(), phase2_seq.len(), total, phase2_internal_offset, atomic_chunk_vocab, virtual_chunk_atoms
     );
 
-    let mut id_remap: AHashMap<u32, u32> =
-        AHashMap::with_capacity(total + atomic_chunk_vocab as usize);
+    let extra_seed = virtual_chunk_atoms
+        .map(|(_, c)| c)
+        .unwrap_or(atomic_chunk_vocab);
+    let mut id_remap: AHashMap<u32, u32> = AHashMap::with_capacity(total + extra_seed as usize);
     let mut final_merges: StdHashMap<Pair, u32> = StdHashMap::with_capacity(total);
-    for i in 0..atomic_chunk_vocab {
-        let id = 256 + i;
-        id_remap.insert(id, id);
-    }
-    let mut next_id: u32 = 256 + atomic_chunk_vocab;
+    let mut next_id: u32 = match virtual_chunk_atoms {
+        Some((base, count)) => {
+            for i in 0..count {
+                let id = base + i;
+                id_remap.insert(id, id);
+            }
+            256
+        }
+        None => {
+            for i in 0..atomic_chunk_vocab {
+                let id = 256 + i;
+                id_remap.insert(id, id);
+            }
+            256 + atomic_chunk_vocab
+        }
+    };
     let mut ptr1 = 0usize;
     let mut ptr2 = 0usize;
 
@@ -1043,6 +1067,28 @@ fn interleave_merge_sequences(
 
 // ========================= Python-facing Tokenizer =========================
 
+impl Tokenizer {
+    /// Bytes for a token id during rank / merge expansion (bytes, merge outputs, or internal chunk atoms).
+    fn token_bytes_for_id(&self, id: u32, token_bytes: &[Vec<u8>]) -> Vec<u8> {
+        if id < 256 {
+            return token_bytes[id as usize].clone();
+        }
+        if let Some(ref chunks) = self.chunk_atom_id_to_bytes {
+            if id >= CHUNK_ATOM_ID_BASE {
+                let idx = id - CHUNK_ATOM_ID_BASE;
+                if (idx as usize) < chunks.len() {
+                    return chunks[idx as usize].clone();
+                }
+            }
+        }
+        if (id as usize) < token_bytes.len() {
+            token_bytes[id as usize].clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 #[pymethods]
 impl Tokenizer {
     #[new]
@@ -1066,8 +1112,12 @@ impl Tokenizer {
     ///   superchunk sequences where each chunk is already a single Phase 1 token.
     ///   Results are interleaved by frequency into one merge table.
     ///
-    /// When `max_superchunk_merges` is set, skips Phase 1: each GPT4 chunk is one token
-    /// (`256`..`256+U-1`), then only Phase 2 runs with at most that many cross-chunk merges.
+    /// When `max_superchunk_merges` is set, skips Phase 1: chunks are treated as atomic for
+    /// training only ([`CHUNK_ATOM_ID_BASE`]+i), then only Phase 2 runs. The reported
+    /// vocabulary (`vocab_size`, `get_mergeable_ranks`) contains **only** superchunk merge
+    /// tokens — not byte tokens and not standalone single-chunk types. Encode emits UTF-8
+    /// bytes for single-chunk superchunks and expands any leftover chunk-atom ids to bytes so
+    /// the stream uses only merge ids (256..) and bytes (0..255).
     ///
     /// The streaming pass always collects both chunk_counts and seq_counts in a
     /// single iteration when allow_superchunk=True, so the iterator is consumed once.
@@ -1134,7 +1184,7 @@ impl Tokenizer {
                         );
                         let p1_len = p1_seq.len() as u32;
                         self.merges =
-                            interleave_merge_sequences(vocab_size, p1_seq, p2_seq, p1_len, 0);
+                            interleave_merge_sequences(vocab_size, p1_seq, p2_seq, p1_len, 0, None);
                         return Ok(());
                     }
                 }
@@ -1358,35 +1408,34 @@ impl Tokenizer {
                 );
                 return Ok(());
             }
-            let max_extra = vocab_size.saturating_sub(256);
-            if u > max_extra {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "vocab_size {} is too small: need at least {} for {} unique GPT4 chunks as atomic tokens",
-                    vocab_size,
-                    256u32.saturating_add(u),
-                    u
-                )));
-            }
             let mut chunk_to_id: AHashMap<CompactString, u32> =
                 AHashMap::with_capacity(unique.len());
             let mut id_to_bytes: Vec<Vec<u8>> = Vec::with_capacity(unique.len());
             let mut str_to_id: StdHashMap<String, u32> = StdHashMap::with_capacity(unique.len());
             for (i, c) in unique.iter().enumerate() {
-                let tid = 256 + i as u32;
+                let tid = CHUNK_ATOM_ID_BASE + i as u32;
                 chunk_to_id.insert(c.clone(), tid);
                 id_to_bytes.push(c.as_bytes().to_vec());
                 str_to_id.insert(c.to_string(), tid);
             }
-            let p2_cap = max_sc.min(vocab_size.saturating_sub(256).saturating_sub(u));
+            let p2_cap = max_sc.min(vocab_size.saturating_sub(256));
             log::info!(
-                "train_from_iterator: superchunk-only — {} atomic chunk token ids (256..{}), up to {} Phase 2 merges",
+                "train_from_iterator: superchunk-only — {} chunk types at internal ids {}..{}, up to {} superchunk merge outputs (ids 256..)",
                 u,
-                256 + u - 1,
+                CHUNK_ATOM_ID_BASE,
+                CHUNK_ATOM_ID_BASE + u - 1,
                 p2_cap
             );
             let (p2_words, p2_counts) = build_phase2_words_atomic(seq_counts, &chunk_to_id);
-            let p2_seq = train_and_record(p2_words, p2_counts, vocab_size, true, u, Some(p2_cap));
-            self.merges = interleave_merge_sequences(vocab_size, vec![], p2_seq, u, u);
+            let p2_seq = train_and_record(p2_words, p2_counts, vocab_size, true, 0, Some(p2_cap));
+            self.merges = interleave_merge_sequences(
+                vocab_size,
+                vec![],
+                p2_seq,
+                0,
+                0,
+                Some((CHUNK_ATOM_ID_BASE, u)),
+            );
             self.chunk_atom_to_id = Some(str_to_id);
             self.chunk_atom_id_to_bytes = Some(id_to_bytes);
             self.superchunk_pattern = Some(superchunk_pattern_str);
@@ -1504,7 +1553,8 @@ impl Tokenizer {
             // ---- Interleave ----
             log::info!("train_from_iterator: interleaving merge sequences");
             let p1_len = phase1_seq.len() as u32;
-            self.merges = interleave_merge_sequences(vocab_size, phase1_seq, phase2_seq, p1_len, 0);
+            self.merges =
+                interleave_merge_sequences(vocab_size, phase1_seq, phase2_seq, p1_len, 0, None);
             log::info!(
                 "train_from_iterator: done — {} merge rules ({} total tokens)",
                 self.merges.len(),
@@ -1542,41 +1592,37 @@ impl Tokenizer {
         self.chunk_pattern.clone()
     }
 
+    /// Bytes + merge tokens for standard / 2-phase training; **only** superchunk merge tokens
+    /// after `max_superchunk_merges` training (no byte tokens and no single-chunk types in the count).
     #[getter]
     pub fn vocab_size(&self) -> u32 {
-        let n_atom = self
-            .chunk_atom_id_to_bytes
-            .as_ref()
-            .map(|v| v.len() as u32)
-            .unwrap_or(0);
-        256 + n_atom + self.merges.len() as u32
+        if self.chunk_atom_to_id.is_some() {
+            self.merges.len() as u32
+        } else {
+            256 + self.merges.len() as u32
+        }
     }
 
+    /// Rank list: bytes `0..256` plus merge outputs, except in superchunk-only mode where only
+    /// superchunk (cross-chunk) merge tokens are listed — no raw bytes and no single-chunk entries.
     pub fn get_mergeable_ranks(&self) -> Vec<(Vec<u8>, u32)> {
         let mut token_bytes: Vec<Vec<u8>> = (0..256_u32).map(|i| vec![i as u8]).collect();
-        let mut ranks: Vec<(Vec<u8>, u32)> = token_bytes
-            .iter()
-            .zip(0u32..)
-            .map(|(b, i)| (b.clone(), i))
-            .collect();
-
-        if let Some(ref chunks) = self.chunk_atom_id_to_bytes {
-            for (i, bytes) in chunks.iter().enumerate() {
-                let tid = 256 + i as u32;
-                if token_bytes.len() <= tid as usize {
-                    token_bytes.resize(tid as usize + 1, Vec::new());
-                }
-                token_bytes[tid as usize] = bytes.clone();
-                ranks.push((bytes.clone(), tid));
-            }
-        }
+        let mut ranks: Vec<(Vec<u8>, u32)> = if self.chunk_atom_to_id.is_some() {
+            Vec::new()
+        } else {
+            token_bytes
+                .iter()
+                .zip(0u32..)
+                .map(|(b, i)| (b.clone(), i))
+                .collect()
+        };
 
         let mut sorted: Vec<_> = self.merges.iter().collect();
         sorted.sort_by_key(|&(_, &tid)| tid);
 
         for (&(left, right), &mid) in &sorted {
-            let mut mb = token_bytes[left as usize].clone();
-            mb.extend(&token_bytes[right as usize]);
+            let mut mb = self.token_bytes_for_id(left, &token_bytes);
+            mb.extend(self.token_bytes_for_id(right, &token_bytes));
             if token_bytes.len() <= mid as usize {
                 token_bytes.resize(mid as usize + 1, Vec::new());
             }
@@ -1590,10 +1636,11 @@ impl Tokenizer {
         if let (Some(ref atom_map), Some(ref sc_re)) =
             (&self.chunk_atom_to_id, &self.compiled_superchunk)
         {
+            let chunk_bytes = self.chunk_atom_id_to_bytes.as_ref();
             let mut all_ids = Vec::new();
             for (a, b) in superchunk_ranges(text, sc_re) {
                 let sc = &text[a..b];
-                let mut ids: Vec<u32> = Vec::new();
+                let mut pieces: Vec<&str> = Vec::new();
                 for m in self.compiled_chunk_pattern.find_iter(sc) {
                     let chunk = match m {
                         Ok(mat) => mat.as_str(),
@@ -1602,10 +1649,22 @@ impl Tokenizer {
                             continue;
                         }
                     };
-                    match atom_map.get(chunk) {
+                    pieces.push(chunk);
+                }
+                // Single-chunk superchunk: no cross-chunk merge token — emit UTF-8 bytes only (not a chunk-atom id).
+                if pieces.len() <= 1 {
+                    if let Some(chunk) = pieces.first() {
+                        all_ids.extend(chunk.bytes().map(|b| b as u32));
+                    }
+                    continue;
+                }
+
+                let mut ids: Vec<u32> = Vec::new();
+                for chunk in &pieces {
+                    match atom_map.get(*chunk) {
                         Some(&id) => ids.push(id),
                         None => {
-                            log::warn!("encode: chunk not in atomic vocabulary, using raw bytes");
+                            log::warn!("encode: chunk not in training vocabulary, using raw bytes");
                             ids.extend(chunk.bytes().map(|b| b as u32));
                         }
                     }
@@ -1624,7 +1683,19 @@ impl Tokenizer {
                         }
                     }
                 }
-                all_ids.extend(ids);
+                // Never emit internal chunk-atom ids: only superchunk merge ids (256..) or raw bytes.
+                for id in ids {
+                    if id >= CHUNK_ATOM_ID_BASE {
+                        if let Some(table) = chunk_bytes {
+                            let idx = id - CHUNK_ATOM_ID_BASE;
+                            if (idx as usize) < table.len() {
+                                all_ids.extend(table[idx as usize].iter().map(|&b| b as u32));
+                                continue;
+                            }
+                        }
+                    }
+                    all_ids.push(id);
+                }
             }
             return all_ids;
         }
@@ -1662,7 +1733,7 @@ impl Tokenizer {
         let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|i| vec![i as u8]).collect();
         if let Some(ref chunks) = self.chunk_atom_id_to_bytes {
             for (i, bytes) in chunks.iter().enumerate() {
-                let tid = 256 + i as u32;
+                let tid = CHUNK_ATOM_ID_BASE + i as u32;
                 if vocab.len() <= tid as usize {
                     vocab.resize(tid as usize + 1, Vec::new());
                 }
@@ -2171,7 +2242,7 @@ mod tests {
     #[test]
     fn test_interleave_phase1_only() {
         let p1 = vec![((1u32, 2u32), 100u64), ((3u32, 4u32), 50u64)];
-        let merges = interleave_merge_sequences(258, p1, vec![], 2, 0);
+        let merges = interleave_merge_sequences(258, p1, vec![], 2, 0, None);
         assert_eq!(merges.get(&(1, 2)), Some(&256));
         assert_eq!(merges.get(&(3, 4)), Some(&257));
     }
@@ -2179,7 +2250,7 @@ mod tests {
     #[test]
     fn test_interleave_phase2_only_base_bytes() {
         let p2 = vec![((97u32, 98u32), 80u64), ((98u32, 99u32), 40u64)];
-        let merges = interleave_merge_sequences(258, vec![], p2, 0, 0);
+        let merges = interleave_merge_sequences(258, vec![], p2, 0, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256));
         assert_eq!(merges.get(&(98, 99)), Some(&257));
     }
@@ -2189,7 +2260,7 @@ mod tests {
         // p1: 100, 30 / p2: 80, 20 -> expected order: p1[0], p2[0], p1[1], p2[1]
         let p1 = vec![((1u32, 2u32), 100u64), ((3u32, 4u32), 30u64)];
         let p2 = vec![((10u32, 11u32), 80u64), ((12u32, 13u32), 20u64)];
-        let merges = interleave_merge_sequences(260, p1, p2, 2, 0);
+        let merges = interleave_merge_sequences(260, p1, p2, 2, 0, None);
         assert_eq!(merges.get(&(1, 2)), Some(&256));
         assert_eq!(merges.get(&(10, 11)), Some(&257));
         assert_eq!(merges.get(&(3, 4)), Some(&258));
@@ -2201,7 +2272,7 @@ mod tests {
         // Equal frequency: Phase 1 must get the lower global ID.
         let p1 = vec![((1u32, 2u32), 50u64)];
         let p2 = vec![((10u32, 11u32), 50u64)];
-        let merges = interleave_merge_sequences(258, p1, p2, 1, 0);
+        let merges = interleave_merge_sequences(258, p1, p2, 1, 0, None);
         assert_eq!(merges.get(&(1, 2)), Some(&256)); // Phase 1 wins tie
         assert_eq!(merges.get(&(10, 11)), Some(&257));
     }
@@ -2211,7 +2282,7 @@ mod tests {
         // p1: (a,b)->p1-local-256, (p1-local-256,c)->p1-local-257
         // Both remap to global 256 and 257 respectively.
         let p1 = vec![((97u32, 98u32), 100u64), ((256u32, 99u32), 50u64)];
-        let merges = interleave_merge_sequences(258, p1, vec![], 2, 0);
+        let merges = interleave_merge_sequences(258, p1, vec![], 2, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256));
         assert_eq!(merges.get(&(256, 99)), Some(&257));
     }
@@ -2223,7 +2294,7 @@ mod tests {
         // Expected: global 256=(a,b), global 257=(256,c)
         let p1 = vec![((97u32, 98u32), 100u64)];
         let p2 = vec![((256u32, 99u32), 50u64)];
-        let merges = interleave_merge_sequences(258, p1, p2, 1, 0);
+        let merges = interleave_merge_sequences(258, p1, p2, 1, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256));
         assert_eq!(merges.get(&(256, 99)), Some(&257));
     }
@@ -2234,14 +2305,14 @@ mod tests {
         // 110 >= 100 -> Phase 1 wins, so 256=(a,b) always lands before 257=(256,c).
         let p1 = vec![((97u32, 98u32), 110u64)];
         let p2 = vec![((256u32, 99u32), 100u64)];
-        let merges = interleave_merge_sequences(258, p1, p2, 1, 0);
+        let merges = interleave_merge_sequences(258, p1, p2, 1, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256));
         assert_eq!(merges.get(&(256, 99)), Some(&257));
     }
 
     #[test]
     fn test_interleave_empty_both() {
-        assert!(interleave_merge_sequences(256, vec![], vec![], 0, 0).is_empty());
+        assert!(interleave_merge_sequences(256, vec![], vec![], 0, 0, None).is_empty());
     }
 
     // ---- Full pipeline: train_and_record + build_phase2_words + interleave ----
@@ -2254,7 +2325,7 @@ mod tests {
         seq_counts.insert(vec![CompactString::from("a"), CompactString::from("b")], 10);
         let (p2_words, p2_counts) = build_phase2_words(seq_counts, &p1_seq);
         let p2_seq = train_and_record(p2_words, p2_counts, 257, true, p1_seq.len() as u32, None);
-        let merges = interleave_merge_sequences(257, p1_seq, p2_seq, 0, 0);
+        let merges = interleave_merge_sequences(257, p1_seq, p2_seq, 0, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256));
     }
 
@@ -2274,7 +2345,7 @@ mod tests {
         let (p2_words, p2_counts) = build_phase2_words(seq_counts, &p1_seq);
         let p2_seq = train_and_record(p2_words, p2_counts, 257, true, p1_seq.len() as u32, None);
 
-        let merges = interleave_merge_sequences(258, p1_seq, p2_seq, 1, 0);
+        let merges = interleave_merge_sequences(258, p1_seq, p2_seq, 1, 0, None);
         assert_eq!(merges.get(&(97, 98)), Some(&256)); // within-chunk first
         assert_eq!(merges.get(&(256, 99)), Some(&257)); // cross-chunk after
     }
@@ -2297,7 +2368,7 @@ mod tests {
         let p2_seq = train_and_record(p2_words, p2_counts, 258, true, p1_seq.len() as u32, None);
         assert_eq!(p2_seq.len(), 2);
 
-        let merges = interleave_merge_sequences(258, vec![], p2_seq, 0, 0);
+        let merges = interleave_merge_sequences(258, vec![], p2_seq, 0, 0, None);
         // First merge of (a,b) must produce 256; second of (256,c) must produce 257.
         assert_eq!(merges.get(&(97, 98)), Some(&256));
         assert_eq!(merges.get(&(256, 99)), Some(&257));
@@ -2318,12 +2389,16 @@ mod tests {
         let u = unique.len() as u32;
         let mut chunk_to_id: AHashMap<CompactString, u32> = AHashMap::new();
         for (i, c) in unique.iter().enumerate() {
-            chunk_to_id.insert(c.clone(), 256 + i as u32);
+            chunk_to_id.insert(c.clone(), CHUNK_ATOM_ID_BASE + i as u32);
         }
         let (p2_words, p2_counts) = build_phase2_words_atomic(seq_counts, &chunk_to_id);
-        let p2_seq = train_and_record(p2_words, p2_counts, 260, true, u, Some(4));
-        let merges = interleave_merge_sequences(260, vec![], p2_seq, u, u);
-        assert_eq!(merges.get(&(256, 257)), Some(&(256 + u)));
+        let p2_seq = train_and_record(p2_words, p2_counts, 260, true, 0, Some(4));
+        let merges =
+            interleave_merge_sequences(260, vec![], p2_seq, 0, 0, Some((CHUNK_ATOM_ID_BASE, u)));
+        assert_eq!(
+            merges.get(&(CHUNK_ATOM_ID_BASE, CHUNK_ATOM_ID_BASE + 1)),
+            Some(&256)
+        );
     }
 
     // ---- Tokenizer public API ----
@@ -2348,6 +2423,19 @@ mod tests {
         t.merges.insert((0, 1), 256);
         t.merges.insert((256, 2), 257);
         assert_eq!(t.vocab_size(), 258);
+    }
+
+    #[test]
+    fn test_superchunk_only_vocab_size_is_merge_count_only() {
+        let mut t = Tokenizer::new();
+        t.chunk_atom_to_id = Some(StdHashMap::new());
+        assert_eq!(t.vocab_size(), 0);
+        t.merges.insert((97, 98), 256);
+        t.merges.insert((256, 99), 257);
+        assert_eq!(t.vocab_size(), 2);
+        let ranks = t.get_mergeable_ranks();
+        assert_eq!(ranks.len(), 2);
+        assert!(!ranks.iter().any(|(_, id)| *id < 256));
     }
 
     #[test]
